@@ -1,0 +1,265 @@
+--[=[
+   @class TranslationHelper
+   Small reusable wrapper around the local player's LocalizationService Translator.
+
+   Owns *how* to safely translate something: loading the translator (pcall-
+   guarded, per Roblox's guidance), remembering each object's original source
+   text so it's only ever translated from source, guarding properties a player
+   can edit so their input is never overwritten, and re-running every tracked
+   translation when the player's locale changes mid-session.
+
+   It has no opinion on *which* objects need translating or *when* they appear -
+   that belongs to whichever script/component calls into it, e.g.
+   StarterPlayerScripts.LocalizationHandler.
+
+   @client
+]=]
+local TranslationHelper = {}
+
+local LocalizationService = game:GetService("LocalizationService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(ReplicatedStorage.Packages.Signal)
+
+-- Fires (no arguments) whenever the player's locale changes: either the real
+-- Translator's LocaleId (used by Translate()/TranslateByKey()), or the
+-- system/account locale (used by GetPlayerLanguage()/TranslateFromDictionary()).
+-- Scripted translations don't auto-update the way non-scripted ones do, so
+-- anything localized through this module should re-run on this signal -
+-- TranslationHelper.Watch() / TranslateProperty() already do that for you.
+TranslationHelper.LocaleChanged = Signal.new()
+
+LocalizationService:GetPropertyChangedSignal("SystemLocaleId"):Connect(function()
+	TranslationHelper.LocaleChanged:Fire()
+end)
+
+local ATTR_SOURCE_PREFIX = "LocalizationSource_"
+local ATTR_APPLIED_PREFIX = "LocalizationApplied_"
+
+local translator -- Translator?, lazily loaded, pcall-guarded
+local attemptedLoad = false
+
+--[[
+    Returns the player's language as a short subtag ("es", "fr", "pt", ...),
+    derived from LocalizationService.SystemLocaleId ("es-es" / "es-419" -> "es").
+    Synchronous (no network call, no Translator needed) and never errors -
+    falls back to "en" for anything unreadable, so a language this game doesn't
+    support just fails every dictionary lookup rather than throwing.
+]]
+function TranslationHelper.GetPlayerLanguage(): string
+	local ok, id = pcall(function()
+		return LocalizationService.SystemLocaleId
+	end)
+	if not ok or typeof(id) ~= "string" or id == "" then
+		return "en"
+	end
+	return id:match("^(%a%a)") or id
+end
+
+-- Loads (once) and caches the local player's Translator. Never errors - returns
+-- nil if it can't be loaded, so every public function below degrades to "leave
+-- the text alone" rather than throwing.
+local function ensureTranslator()
+	if attemptedLoad then
+		return translator
+	end
+	attemptedLoad = true
+
+	local player = Players.LocalPlayer
+	if not player then
+		return nil
+	end
+
+	local ok, result = pcall(function()
+		return LocalizationService:GetTranslatorForPlayerAsync(player)
+	end)
+
+	if not ok or typeof(result) ~= "Instance" then
+		warn("[TranslationHelper] Failed to load translator, text will stay untranslated:", result)
+		return nil
+	end
+
+	translator = result
+	translator:GetPropertyChangedSignal("LocaleId"):Connect(function()
+		TranslationHelper.LocaleChanged:Fire()
+	end)
+	return translator
+end
+
+--[[
+    Returns the local player's Translator, loading it on first use. May be nil.
+]]
+function TranslationHelper.GetTranslator(): Translator?
+	return ensureTranslator()
+end
+
+--[[
+    Translates `source` in the context of `context` (usually the Instance being
+    localized - Roblox uses it to resolve LocalizationTable context). Always
+    returns a string: falls back to `source` itself if the translator isn't
+    available or nothing usable came back, so call sites never need their own
+    fallback handling.
+]]
+function TranslationHelper.Translate(context: Instance, source: string): string
+	if typeof(source) ~= "string" or source == "" then
+		return source
+	end
+
+	local t = ensureTranslator()
+	if not t then
+		return source
+	end
+
+	local ok, result = pcall(function()
+		return t:Translate(context, source)
+	end)
+	if ok and typeof(result) == "string" and result ~= "" then
+		return result
+	end
+	return source
+end
+
+--[[
+    Looks up a parameterised localization-table entry by Key, substituting
+    `parameters` using Roblox's {name} format (Translator:FormatByKey). Returns
+    nil - not the key, not the source - when the entry doesn't exist or the
+    translator isn't loaded, so callers must supply their own English fallback.
+]]
+function TranslationHelper.TranslateByKey(key: string, parameters: { [string]: any }?): string?
+	local t = ensureTranslator()
+	if not t then
+		return nil
+	end
+
+	local ok, result = pcall(function()
+		return t:FormatByKey(key, parameters or {})
+	end)
+	if ok and typeof(result) == "string" and result ~= "" then
+		return result
+	end
+	return nil
+end
+
+--[[
+    Looks up `source` in a manual translation dictionary (see
+    TextBoxTranslations.luau for the shape and why this exists alongside
+    Translate()/TranslateByKey()) for the player's current language
+    (GetPlayerLanguage()). Returns nil - never errors, never returns an empty
+    string - when there's no entry for this source or this language, so a
+    language the dictionary doesn't cover just leaves the original text in place.
+
+    dictionary shape: { [sourceText]: { [language]: translatedText } }
+]]
+function TranslationHelper.TranslateFromDictionary(source: string, dictionary: { [string]: { [string]: string } }): string?
+	local ok, result = pcall(function()
+		local entry = dictionary[source]
+		if not entry then
+			return nil
+		end
+		return entry[TranslationHelper.GetPlayerLanguage()]
+	end)
+	if ok and typeof(result) == "string" and result ~= "" then
+		return result
+	end
+	return nil
+end
+
+--[[
+    Returns the source text previously remembered for obj[prop] via
+    TranslateProperty, without triggering a translation. Useful when other code
+    needs to identify an object by its original (pre-translation) text.
+]]
+function TranslationHelper.GetRememberedSource(obj: Instance, prop: string): string?
+	local stored = obj:GetAttribute(ATTR_SOURCE_PREFIX .. prop)
+	return if typeof(stored) == "string" then stored else nil
+end
+
+--[[
+    Registers `run` to execute now and again every time the player's locale
+    changes. If `obj` is given, the registration is dropped once it's destroyed.
+    Returns the wrapped function so a caller can also invoke it manually (e.g.
+    after detecting that other game code overwrote the text it's tracking).
+]]
+function TranslationHelper.Watch(run: () -> (), obj: Instance?): () -> ()
+	local wrapped = function()
+		local ok, err = pcall(run)
+		if not ok then
+			warn("[TranslationHelper]", err)
+		end
+	end
+
+	local connection = TranslationHelper.LocaleChanged:Connect(wrapped)
+	wrapped()
+
+	if obj then
+		obj.Destroying:Once(function()
+			connection:Disconnect()
+		end)
+	end
+
+	return wrapped
+end
+
+--[[
+    Safely localizes a single property (usually "Text" or "PlaceholderText") of
+    `obj`. The property's value the first time it's seen is treated as the
+    source of truth - stashed on an attribute so it is never translated twice -
+    and re-applied on every locale change via Watch().
+
+    opts.guardEditable - only write while the property still shows the source
+        value or a value this module previously wrote. Use this for anything a
+        player can edit (a TextBox's .Text) so their input is never clobbered.
+    opts.provider(source) - overrides how the replacement text is produced,
+        e.g. to call TranslateByKey with a caller-specific key instead of
+        translating the literal source string. Return nil to leave the current
+        value untouched (e.g. when the "source" turns out not to be one of the
+        recognised static values).
+
+    Returns the Watch()-wrapped function in case the caller needs to force a
+    re-check outside of a locale change.
+]]
+function TranslationHelper.TranslateProperty(
+	obj: Instance,
+	prop: string,
+	opts: { guardEditable: boolean?, provider: ((string) -> string?)? }?
+): () -> ()
+	opts = opts or {}
+	local sourceAttr = ATTR_SOURCE_PREFIX .. prop
+	local appliedAttr = ATTR_APPLIED_PREFIX .. prop
+
+	return TranslationHelper.Watch(function()
+		local target = obj :: any
+
+		local source = obj:GetAttribute(sourceAttr)
+		if source == nil then
+			local current = target[prop]
+			if typeof(current) ~= "string" or current == "" then
+				return
+			end
+			obj:SetAttribute(sourceAttr, current)
+			source = current
+		end
+
+		local current = target[prop]
+
+		if opts.guardEditable then
+			local applied = obj:GetAttribute(appliedAttr)
+			-- Not the untouched static value and not our own output => someone
+			-- else (a player, or other game code) changed it - leave it alone.
+			if current ~= source and current ~= applied then
+				return
+			end
+		end
+
+		local translated = if opts.provider then opts.provider(source :: string) else TranslationHelper.Translate(obj, source :: string)
+
+		if not translated or translated == current then
+			return
+		end
+
+		target[prop] = translated
+		obj:SetAttribute(appliedAttr, translated)
+	end, obj)
+end
+
+return TranslationHelper
