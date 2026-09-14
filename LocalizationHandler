@@ -1,0 +1,232 @@
+--[[
+    LocalizationHandler  —  LocalScript (StarterPlayer/StarterPlayerScripts)
+
+    The specific half of client localization: WHICH objects need
+    translating and WHEN they appear. The HOW lives in TranslationHelper.
+
+    Scope: TextBox.Text only. Testing showed the real LocalizationTable/
+    Translator correctly updates a TextLabel's .Text, but the same calls did
+    not visibly update a TextBox's .Text even with a matching CSV entry - so
+    these are translated manually from TextBoxTranslations.luau (a small
+    dictionary keyed by source text + language) instead of going through
+    Translator:Translate()/FormatByKey(). See that module to fill in the actual
+    translated strings from the existing CSV table.
+
+    Does not redesign any UI and does not touch the objects' original source
+    text - translated values are only ever written to the live TextBox.
+
+    Targets:
+      1. "Enter ID#"     — Catalog quick-ID box (AvatarEditorMenu.Catalog...ShirtID)
+      2. "Build #<n>"    — PrivateServerProps build-slot name boxes
+      3. "BORN TO SING"  — Neon_Sign TextBox, cloned per-lot when a house is built
+]]
+
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local TranslationHelper = require(ReplicatedStorage.Modules.Client.Localization.TranslationHelper)
+local TextBoxTranslations = require(ReplicatedStorage.Modules.Client.Localization.TextBoxTranslations)
+
+local ATTR_HOOKED = "LocalizationHooked"
+
+-- Resolve a child path with per-step timeouts; returns nil instead of erroring.
+local function resolvePath(root: Instance, names: { string }, timeout: number): Instance?
+	local node: Instance? = root
+	for _, name in names do
+		if not node then
+			return nil
+		end
+		node = (node :: Instance):WaitForChild(name, timeout)
+	end
+	return node
+end
+
+--------------------------------------------------------------------------------
+-- Target 1 — "Enter ID#"  (Catalog quick-ID box)
+--------------------------------------------------------------------------------
+-- Lives at a fixed spot under the player's own PlayerGui rather than behind a
+-- CollectionService-tagged component, so this resolves it directly instead of
+-- scanning for one. Generous timeout since this branch of the Catalog tab may
+-- not exist until the player actually opens it.
+local function hookShirtIdBox()
+	local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+	local box = resolvePath(playerGui, {
+		"NoResetGUIHandler",
+		"AvatarEditorHolder",
+		"AvatarEditorMenu",
+		"Catalog",
+		"Container",
+		"ScaleFrame",
+		"Buttons",
+		"ShirtID",
+	}, 60)
+
+	if not box then
+		warn("[LocalizationHandler] Could not find the Catalog quick-ID box (ShirtID) - path may have changed")
+		return
+	end
+	if box:GetAttribute(ATTR_HOOKED) then
+		return
+	end
+	box:SetAttribute(ATTR_HOOKED, true)
+
+	TranslationHelper.TranslateProperty(box, "Text", {
+		guardEditable = true, -- guard in case this is (or becomes) a player-typed field
+		provider = function(source: string): string?
+			return TranslationHelper.TranslateFromDictionary(source, TextBoxTranslations)
+		end,
+	})
+end
+
+task.spawn(hookShirtIdBox)
+
+--------------------------------------------------------------------------------
+-- Target 2 — "Build #<n>"  (PrivateServerProps build slots)
+--------------------------------------------------------------------------------
+local BUILD_SOURCE_KEY = "Build #{number1}" -- matches the key in TextBoxTranslations.luau
+local BUILD_DEFAULT_PATTERN = "^Build #(%d+)$"
+
+local function hookBuildSlot(textBox: TextBox)
+	if textBox:GetAttribute(ATTR_HOOKED) then
+		return
+	end
+	textBox:SetAttribute(ATTR_HOOKED, true)
+
+	-- Resolves the slot's number from its default text, once, and caches it -
+	-- returns nil for anything that isn't showing a default "Build #<n>" name
+	-- (including a player's custom name), so it's never mistaken for one.
+	local function slotIndex(): number?
+		local stored = textBox:GetAttribute("LocalizationBuildIndex")
+		if typeof(stored) == "number" then
+			return stored
+		end
+		local parsed = string.match(textBox.Text, BUILD_DEFAULT_PATTERN)
+		if parsed then
+			local n = tonumber(parsed)
+			textBox:SetAttribute("LocalizationBuildIndex", n)
+			return n
+		end
+		return nil
+	end
+
+	local retranslate = TranslationHelper.TranslateProperty(textBox, "Text", {
+		-- A player-renamed build never matches BUILD_DEFAULT_PATTERN, so
+		-- guardEditable alone keeps this from ever overwriting a rename.
+		guardEditable = true,
+		provider = function(_source: string): string?
+			local index = slotIndex()
+			if not index then
+				return nil -- a custom/player-set name - never touch it
+			end
+
+			local translated = TranslationHelper.TranslateFromDictionary(BUILD_SOURCE_KEY, TextBoxTranslations)
+			if not translated then
+				return nil -- no dictionary entry for this language - leave the English default
+			end
+
+			return (translated:gsub("{number1}", tostring(index)))
+		end,
+	})
+
+	-- The panel rewrites this text whenever it (re)loads slot names. If it
+	-- reverts to a default "Build #<n>", re-localise; a genuine player rename
+	-- never matches the pattern, so it's never fought.
+	textBox:GetPropertyChangedSignal("Text"):Connect(function()
+		if string.match(textBox.Text, BUILD_DEFAULT_PATTERN) then
+			retranslate()
+		end
+	end)
+end
+
+local function scanBuildSlots(propsPanel: Instance)
+	task.spawn(function()
+		local list = resolvePath(propsPanel, { "OuterBox", "Frame", "Builds", "List" }, 15)
+		if not list then
+			return -- e.g. the house-scoped props panel, which has no build slots
+		end
+
+		local function consider(slot: Instance)
+			if not string.match(slot.Name, "^b%d+$") then
+				return
+			end
+			local editFrame = slot:WaitForChild("Edit", 10)
+			local textBox = editFrame and editFrame:WaitForChild("TextBox", 10)
+			if textBox and textBox:IsA("TextBox") then
+				hookBuildSlot(textBox)
+			end
+		end
+
+		for _, slot in list:GetChildren() do
+			consider(slot)
+		end
+		list.ChildAdded:Connect(consider)
+	end)
+end
+
+for _, propsPanel in CollectionService:GetTagged("PrivateServerProps") do
+	scanBuildSlots(propsPanel)
+end
+CollectionService:GetInstanceAddedSignal("PrivateServerProps"):Connect(scanBuildSlots)
+
+--------------------------------------------------------------------------------
+-- Target 3 — "BORN TO SING"  (Neon_Sign, cloned per-lot)
+--------------------------------------------------------------------------------
+-- ServerStorage.Houses["103_House"] is only the template. Which lot (if any) a
+-- given player builds that house on is entirely up to them, so LotService can
+-- clone it to any folder under workspace["001_Lots"] - there's no fixed path to
+-- WaitForChild(). Instead this watches 001_Lots for any TextBox that's either
+-- nested under a "Neon_Sign" container or still shows the sign's own source
+-- text, which matches it wherever - and however many times, across different
+-- lots/players - it gets cloned in.
+local SIGN_CONTAINER_NAME = "Neon_Sign"
+local SIGN_SOURCE_TEXT = "BORN TO SING"
+
+local function isSignTextBox(obj: Instance): boolean
+	if not obj:IsA("TextBox") then
+		return false
+	end
+
+	local ancestor = obj.Parent
+	for _ = 1, 8 do
+		if not ancestor or ancestor == Workspace then
+			break
+		end
+		if ancestor.Name == SIGN_CONTAINER_NAME then
+			return true
+		end
+		ancestor = ancestor.Parent
+	end
+
+	-- ...or, as a fallback, the object's (remembered or current) text is
+	-- exactly the sign - covers a differently-named container on some houses.
+	local text = TranslationHelper.GetRememberedSource(obj, "Text") or (obj :: any).Text
+	return typeof(text) == "string" and string.upper(text) == SIGN_SOURCE_TEXT
+end
+
+local function hookSignTextBox(obj: Instance)
+	if obj:GetAttribute(ATTR_HOOKED) or not isSignTextBox(obj) then
+		return
+	end
+	obj:SetAttribute(ATTR_HOOKED, true)
+
+	TranslationHelper.TranslateProperty(obj, "Text", {
+		guardEditable = true, -- it's a TextBox; leave it alone if anything ever writes into it
+		provider = function(source: string): string?
+			return TranslationHelper.TranslateFromDictionary(source, TextBoxTranslations)
+		end,
+	})
+end
+
+task.spawn(function()
+	local lots = Workspace:WaitForChild("001_Lots", 30)
+	if not lots then
+		return
+	end
+	for _, descendant in lots:GetDescendants() do
+		hookSignTextBox(descendant)
+	end
+	-- Houses can be (re)built onto any lot after this script starts.
+	lots.DescendantAdded:Connect(hookSignTextBox)
+end)
