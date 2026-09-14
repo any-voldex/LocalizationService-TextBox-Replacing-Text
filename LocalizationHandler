@@ -1,5 +1,6 @@
 --[[
     LocalizationHandler  —  LocalScript (StarterPlayer/StarterPlayerScripts)
+    game.StarterPlayer.StarterPlayerScripts.LocalizationHandler
 
     The specific half of client localization: WHICH objects need
     translating and WHEN they appear. The HOW lives in TranslationHelper.
