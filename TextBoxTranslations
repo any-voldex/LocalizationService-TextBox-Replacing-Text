@@ -1,0 +1,41 @@
+--[[
+    TextBoxTranslations
+game.ReplicatedStorage.Modules.Client.Localization.TextBoxTranslations
+    Manual translation dictionary for TextBox.Text values, used in place of the
+    real LocalizationTable/Translator for these specific objects.
+
+    Why: testing showed Translator:Translate() / FormatByKey() correctly update
+    a TextLabel's .Text, but the same calls did not visibly change a TextBox's
+    .Text even with a matching CSV entry - so these are looked up here and
+    written to .Text directly instead, driven off the player's locale
+    (TranslationHelper.GetPlayerLanguage()).
+
+    Keyed by the exact English source text, then by language ("es", "fr", "pt").
+    A key/language combination that's missing just means the object keeps its
+    original English text - TranslationHelper.TranslateFromDictionary() never
+    errors and never returns an empty replacement.
+
+    Fill these in from the existing CSV localization table (same source
+    strings, same translations - just duplicated here for the objects this
+    applies to). "Build #{number1}" keeps Roblox's {number1} parameter syntax;
+    LocalizationHandler substitutes the real number itself.
+]]
+return {
+	["Enter ID#"] = {
+		es = "Ingresa el ID#",
+		fr = "Entrez l’ID#",
+		pt = "Digite o ID#",
+	},
+
+	["BORN TO SING"] = {
+		es = "NACER PARA CANTAR",
+		fr = "NÉ POUR CHANTER",
+		pt = "NASCIDO PARA CANTAR",
+	},
+
+	["Build #{number1}"] = {
+		es = "Construcción #{number1}",
+		fr = "Construction #{number1}",
+		pt = "Construção #{number1}",
+	},
+}
