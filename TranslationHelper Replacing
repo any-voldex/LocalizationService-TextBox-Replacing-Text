@@ -1,5 +1,6 @@
 --[=[
    @class TranslationHelper
+   game.ReplicatedStorage.Modules.Client.Localization.TranslationHelper
    Small reusable wrapper around the local player's LocalizationService Translator.
 
    Owns *how* to safely translate something: loading the translator (pcall-
